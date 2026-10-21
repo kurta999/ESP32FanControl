@@ -49,6 +49,7 @@ async function api(route, values) {
     restored.auto_enabled=original.auto_enabled?'1':'0';
     restored.strategy=original.strategy;
     restored.curve_hysteresis_c=String(original.curve_hysteresis_c);
+    restored.curve_deadband_c=String(original.curve_deadband_c);
     restored.curve=original.curve_points.map(p=>p.temperature_c+':'+p.percent).join(',');
     await api('/api/control',restored);
     console.log('Original control configuration restored.');

@@ -70,11 +70,14 @@ async function api(route, values) {
     assert.equal(await page.locator('#curve-points .curve-row').count(), pointCount);
     await page.locator('input[data-temperature]').first().fill('33');
     await page.locator('[data-duty]').last().fill('100');
+    await page.locator('#curve-deadband').fill('2.5');
     response = page.waitForResponse(r => r.url().endsWith('/api/control') && r.request().method() === 'POST');
     await page.locator('#curve-save').click();
     assert.equal((await response).status(), 200);
     await page.waitForFunction(() => document.getElementById('message').textContent.includes('Curve saved'));
-    assert.equal((await api('/api/status')).control.curve_points[0].temperature_c, 33);
+    const savedCurve = (await api('/api/status')).control;
+    assert.equal(savedCurve.curve_points[0].temperature_c, 33);
+    assert.equal(savedCurve.curve_deadband_c, 2.5);
     response = page.waitForResponse(r => r.url().endsWith('/api/fan/off') && r.request().method() === 'POST');
     await page.locator('#off').click();
     assert.equal((await response).status(), 200);
@@ -120,6 +123,7 @@ async function api(route, values) {
     restored.auto_enabled = original.auto_enabled ? '1' : '0';
     restored.strategy = original.strategy;
     restored.curve_hysteresis_c = String(original.curve_hysteresis_c);
+    restored.curve_deadband_c = String(original.curve_deadband_c);
     restored.curve = original.curve_points.map(p => p.temperature_c + ':' + p.percent).join(',');
     await api('/api/control', restored);
   }

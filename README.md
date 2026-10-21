@@ -12,7 +12,7 @@ Captured from the web server running on a physical ESP32. The graphs show its li
 
 ### Editable curve and live operating point
 
-The amber vertical line tracks current temperature, the horizontal guide shows applied fan duty, and their intersection marks the live operating point. A purple target marker appears when startup assistance temporarily differs from the requested speed.
+The amber vertical line tracks current temperature, the horizontal guide shows applied fan duty, and their intersection marks the live operating point. A purple target marker appears when startup assistance temporarily differs from the requested speed. The curve card also shows when the temperature deadband is holding the duty steady.
 
 ![Curve editor with editable points and a live temperature/fan operating marker](docs/screenshots/curve-editor.png)
 
@@ -87,15 +87,17 @@ Choose a control mode from the dropdown:
 
 The automatic ON/OFF switch returns to Manual when OFF and resumes the last automatic strategy when ON. Manual web commands are rejected while either automatic strategy is active. A numeric serial command explicitly selects Manual and saves that duty.
 
-The default curve is 35 째C / 0%, 40 째C / 30%, 50 째C / 65%, and 60 째C / 100%. Curve restart hysteresis defaults to 1 째C above the last 0% point and can be set from 0 to 10 째C. The temperature offset can be set from -20 to +20 째C and affects displayed/controlled temperature; it is a correction, not a room-temperature calibration.
+The default curve is 35 째C / 0%, 40 째C / 30%, 50 째C / 65%, and 60 째C / 100%. Curve restart hysteresis defaults to 1 째C above the last 0% point and can be set from 0 to 10 째C. **Speed-change deadband** defaults to **2 캜** and is configurable from 0 to 10 캜 in the curve editor (0 disables it). The fan holds its duty while temperature stays within this distance of the last accepted temperature. For example, after accepting 45 캜, readings from 43 to 47 캜 keep the same duty; above 47 캜 or below 43 캜 it recalculates and sets a new reference. Small steps therefore still accumulate into an adjustment. Stopping, restarting, reaching the top curve point, and sensor-fault fallback act immediately. The graph continues to show the actual temperature and held duty. This setting is saved to flash.
+
+The temperature offset can be set from -20 to +20 째C and affects displayed/controlled temperature; it is a correction, not a room-temperature calibration.
 
 Non-finite, implausible, or stale readings in Automatic/Curve mode request 100% duty, overriding configured curve/automatic maxima. First-time defaults use Manual at 50%; enabling automatic control is an explicit user setting. Existing saved Wi-Fi settings and earlier control settings are preserved on upgrade.
 
 ## HTTP API
 
-- `GET /api/status`: JSON target/applied duty, configured limits, PWM pin/frequency, startup state, Wi-Fi state, station/AP IPs, and saved-settings state, chip temperature, and a `control` configuration object. Passwords are never returned.
+- `GET /api/status`: JSON target/applied duty, configured limits, PWM pin/frequency, startup state, Wi-Fi state, station/AP IPs, and saved-settings state, chip temperature, and a `control` configuration object. Curve status includes `curve_holding` and `curve_reference_c`. Passwords are never returned.
 - `GET /api/history?minutes=5`: choose 5, 10, 20, or 30. Returns uptime, sample interval, and chronological samples `[age_seconds, temperature_c_or_null, applied_percent]`.
-- `POST /api/control`: partial form update using `auto_enabled` (0/1), `strategy` (`threshold`/`curve`), `stop_c`, `start_c`, `full_c`, `min_percent`, `max_percent`, `offset_c`, `curve_hysteresis_c`, and/or `curve` (e.g. `35:0,40:30,50:65,60:100`). Invalid or duplicate fields reject the entire update without modifying flash/runtime settings.
+- `POST /api/control`: partial form update using `auto_enabled` (0/1), `strategy` (`threshold`/`curve`), `stop_c`, `start_c`, `full_c`, `min_percent`, `max_percent`, `offset_c`, `curve_hysteresis_c`, `curve_deadband_c`, and/or `curve` (e.g. `35:0,40:30,50:65,60:100`). Invalid or duplicate fields reject the entire update without modifying flash/runtime settings.
 - `POST /api/wifi`, form body with `ssid` and `password`: validate and save station settings in flash, then reconnect. Returns HTTP 400 for invalid input or HTTP 503 if flash storage fails.
 - `POST /api/fan/off`, no arguments: stop immediately, select Manual, and persist the off state. Works from Automatic and Curve modes too.
 - `POST /api/fan`, form body `percent=50`: apply zero (off) or an integer within the configured running limits and return status. Invalid/missing/duplicate arguments return HTTP 400 without changing the setting. Automatic strategies return HTTP 409 for manual web commands.
@@ -123,7 +125,8 @@ Verified on an ESP32-D0WDQ6 with 4 MB flash:
 - Fan and Wi-Fi setup pages responded over the local network.
 - Manual 100%, automatic cutoff/ramp/hysteresis, curve interpolation, add/remove/save, and invalid-input handling passed on the live device.
 - All four history windows and desktop/mobile layouts passed browser checks without JavaScript errors.
-- Reboot restored mode, curve points, thresholds, offset, manual duty, and Wi-Fi settings.
+- Reboot restored mode, curve points, speed-change deadband, thresholds, offset, manual duty, and Wi-Fi settings.
+- Anchored deadband tests covered repeated �2 캜 oscillations, gradual drift, disabled deadband, and immediate stop/top-point/fault response. The live device held its duty and saved a changed deadband through reboot.
 - The Turn fan off button stopped Curve mode, cancelled startup assistance, and remained off after reboot.
 - The Wi-Fi setup endpoint saved credentials to NVS; a reboot loaded them and rejoined the network.
 - The WPA2 setup AP was visible and accepted a PC connection.
@@ -141,7 +144,7 @@ node tests/test_dashboard.cjs http://192.168.0.122
 node tests/capture_screenshots.cjs http://192.168.0.122
 ```
 
-The native tests download a Windows GCC runtime through PlatformIO and check thresholds, hysteresis, curve interpolation/validation, invalid-reading fallback, and 30-minute ring-buffer retention. Device/browser tests exercise real controls and restore the original settings afterward. Browser tests use an installed Chrome browser; generated dependencies and screenshots remain under ignored `.pio/`.
+The native tests download a Windows GCC runtime through PlatformIO and check thresholds, hysteresis, curve interpolation/validation, anchored speed deadband and its bypass conditions, invalid-reading fallback, and 30-minute ring-buffer retention. Device/browser tests exercise real controls and restore the original settings afterward. Browser tests use an installed Chrome browser; generated dependencies and screenshots remain under ignored `.pio/`.
 
 ## References
 

@@ -2,6 +2,7 @@
 #include <cassert>
 #include <cstdio>
 #include <limits>
+#include <initializer_list>
 
 int main() {
     ControlConfig c;
@@ -68,6 +69,50 @@ int main() {
     assert(validControl(c, 20, 100));
     d = decideFan(c, 100, true, true, 100); assert(d.percent == 0 && !d.running && !d.failsafe);
     d = decideFan(c, NAN, false, true, 100); assert(d.percent == 0 && !d.failsafe);
+    // Speed changes use an anchored temperature band, not the previous sample.
+    c = ControlConfig{}; c.autoEnabled = 1; c.curveMode = 1;
+    CurveState state;
+    bool running = false;
+    auto sample = [&](float temperature, bool valid = true) {
+        auto result = stabilizeCurve(c, temperature, running,
+            decideFan(c, temperature, valid, running, 100), state);
+        running = result.running;
+        return result;
+    };
+    d = sample(45); assert(d.percent == 48 && state.referenceC == 45);
+    for (float t : {46.0f, 44.0f, 47.0f, 43.0f, 46.5f, 44.5f}) {
+        d = sample(t); assert(d.percent == 48 && state.referenceC == 45 && state.holding);
+    }
+    d = sample(47.1f); assert(d.percent == 55 && state.referenceC == 47.1f && !state.holding);
+    d = sample(48); assert(d.percent == 55 && state.holding);
+    d = sample(49); assert(d.percent == 55);
+    d = sample(49.2f); assert(d.percent == 62 && !state.holding);
+    d = sample(47); assert(d.percent == 55 && !state.holding);
+    // Stop, restart, top endpoint and sensor faults bypass the speed band.
+    c.curveDeadbandC = 10;
+    d = sample(35); assert(d.percent == 0 && !running && !state.holding);
+    d = sample(35.5f); assert(d.percent == 0);
+    d = sample(36); assert(d.percent == 20 && running);
+    d = sample(35); assert(d.percent == 0 && !running);
+    d = sample(36); assert(d.percent == 20 && running);
+    state = CurveState{};
+    d = sample(59); assert(d.percent == 97);
+    d = sample(60); assert(d.percent == 100 && !state.holding);
+    d = sample(59); assert(d.percent == 100 && state.holding);
+    d = sample(NAN, false); assert(d.percent == 100 && d.failsafe && std::isnan(state.referenceC));
+    d = sample(45); assert(d.percent == 48 && !state.holding);
+    c.curveDeadbandC = 0;
+    d = sample(46); assert(d.percent == 51 && !state.holding);
+    c.curveMode = 0;
+    d = sample(46); assert(d.percent == 51 && std::isnan(state.referenceC));
+    c.autoEnabled = 0; c.manualPercent = 0;
+    d = sample(46); assert(d.percent == 0 && !state.holding);
+    for (float invalid : {-1.0f, 10.1f, std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::infinity()}) {
+        bad = ControlConfig{}; bad.curveDeadbandC = invalid;
+        assert(!validControl(bad, 20, 100));
+    }
+    bad = ControlConfig{}; bad.curveDeadbandC = 0; assert(validControl(bad, 20, 100));
+    bad.curveDeadbandC = 10; assert(validControl(bad, 20, 100));
     TemperatureHistory<3> history;
     assert(history.size() == 0);
     history.add(0, 40, 20); history.add(5, 41, 30); history.add(10, NAN, 100);

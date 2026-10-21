@@ -50,7 +50,7 @@ try:
     print('Temperature and all four history windows OK', flush=True)
     before = status()['control']
     for body in ['', 'unknown=1', 'auto_enabled=2', 'auto_enabled=1&auto_enabled=0',
-                 'start_c=nan', 'start_c=inf', 'start_c=bad', 'offset_c=21',
+                 'curve_deadband_c=-1', 'curve_deadband_c=11', 'curve_deadband_c=nan', 'start_c=nan', 'start_c=inf', 'start_c=bad', 'offset_c=21',
                  'min_percent=20.5', 'min_percent=256', 'max_percent=101',
                  'stop_c=40&start_c=40', 'full_c=30', 'min_percent=70&max_percent=60']:
         assert request('/api/control', body)[0] == 400, body
@@ -81,9 +81,16 @@ try:
     print('High-temperature full-duty response OK', flush=True)
     t = status()['temperature_c']
     curve = f'{round(t-10,1)}:0,{round(t,1)}:60,{round(t+10,1)}:100'
-    s = configure(strategy='curve', curve=curve, curve_hysteresis_c=1)
+    s = configure(strategy='curve', curve=curve, curve_hysteresis_c=1, curve_deadband_c=2.5)
     assert s['control']['strategy'] == 'curve' and len(s['control']['curve_points']) == 3
     assert 50 <= s['target_percent'] <= 70
+    assert s['control']['curve_deadband_c'] == 2.5
+    assert isinstance(s['curve_reference_c'], (float, int))
+    reference, duty = s['curve_reference_c'], s['target_percent']
+    time.sleep(3.2)
+    held = status()
+    if abs(held['temperature_c'] - reference) < 2.4:
+        assert held['target_percent'] == duty and held['curve_reference_c'] == reference
     before = s['control']
     for bad_curve in ['35:0', '35:0,35:100', '40:30,35:100', '35:50,40:30',
                       '35:0,40:10', '35:0,40:101', '35:0,40:100,', 'bad',
@@ -108,6 +115,7 @@ finally:
     restored['auto_enabled'] = int(original['auto_enabled'])
     restored['strategy'] = original['strategy']
     restored['curve_hysteresis_c'] = original['curve_hysteresis_c']
+    restored['curve_deadband_c'] = original['curve_deadband_c']
     restored['curve'] = ','.join(f"{p['temperature_c']}:{p['percent']}" for p in original['curve_points'])
     configure(**restored)
     print('Original user control settings restored', flush=True)

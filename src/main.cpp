@@ -32,6 +32,7 @@ bool wifiSaved = false;
 bool networkChangePending = false;
 uint32_t networkChangeAt = 0;
 ControlConfig control;
+CurveState curveState;
 bool controlSaved = false;
 bool autoRunning = false;
 bool temperatureValid = false;
@@ -113,7 +114,7 @@ ControlConfig defaultControlConfig() {
 bool saveControl(const ControlConfig &candidate) {
     Preferences preferences;
     if (!preferences.begin("fan-control", false)) return false;
-    const bool ok = preferences.putBytes("control-v2", &candidate, sizeof(candidate)) == sizeof(candidate);
+    const bool ok = preferences.putBytes("control-v3", &candidate, sizeof(candidate)) == sizeof(candidate);
     preferences.end();
     return ok;
 }
@@ -128,8 +129,13 @@ void loadControl() {
     Preferences preferences;
     if (preferences.begin("fan-control", false)) {
         bool loaded = false;
-        if (preferences.isKey("control-v2") && preferences.getBytesLength("control-v2") == sizeof(candidate))
-            loaded = preferences.getBytes("control-v2", &candidate, sizeof(candidate)) == sizeof(candidate);
+        if (preferences.isKey("control-v3") && preferences.getBytesLength("control-v3") == sizeof(candidate))
+            loaded = preferences.getBytes("control-v3", &candidate, sizeof(candidate)) == sizeof(candidate);
+        else if (preferences.isKey("control-v2") && preferences.getBytesLength("control-v2") == offsetof(ControlConfig, curveDeadbandC)) {
+            // v2 has the identical prefix; retain the new field's 2 C default.
+            const size_t legacySize = offsetof(ControlConfig, curveDeadbandC);
+            loaded = preferences.getBytes("control-v2", &candidate, legacySize) == legacySize;
+        }
         else if (preferences.isKey("control-v1") && preferences.getBytesLength("control-v1") == sizeof(legacy)
             && preferences.getBytes("control-v1", &legacy, sizeof(legacy)) == sizeof(legacy)) {
             candidate.stopC = legacy.stopC; candidate.startC = legacy.startC;
@@ -159,7 +165,8 @@ void applyDuty(unsigned percent) {
 
 void updateControl() {
     const bool fresh = temperatureValid && temperatureSampled && millis() - lastTemperatureAt <= TEMPERATURE_STALE_MS;
-    const auto decision = decideFan(control, currentTemperature(), fresh, autoRunning, FAN_MAX_PERCENT, FAN_MIN_PERCENT);
+    const auto requested = decideFan(control, currentTemperature(), fresh, autoRunning, FAN_MAX_PERCENT, FAN_MIN_PERCENT);
+    const auto decision = stabilizeCurve(control, currentTemperature(), autoRunning, requested, curveState);
     targetPercent = decision.percent;
     autoRunning = decision.running;
     sensorFailsafe = decision.failsafe;
@@ -179,6 +186,7 @@ bool changeControl(const ControlConfig &candidate) {
     if (!validControl(candidate, FAN_MIN_PERCENT, FAN_MAX_PERCENT) || !saveControl(candidate)) return false;
     if (candidate.autoEnabled != control.autoEnabled || candidate.curveMode != control.curveMode) autoRunning = false;
     control = candidate;
+    curveState = CurveState{};
     controlSaved = true;
     updateControl();
     return true;
@@ -303,6 +311,8 @@ void sendStatus() {
     json += ",\"temperature_valid\":" + String(temperatureValid ? "true" : "false");
     json += ",\"temperature_age_ms\":" + (temperatureSampled ? String(millis() - lastTemperatureAt) : String("null"));
     json += ",\"uptime_s\":" + String(uptimeSeconds());
+    json += ",\"curve_holding\":" + String(curveState.holding ? "true" : "false");
+    json += ",\"curve_reference_c\":" + (std::isfinite(curveState.referenceC) ? String(curveState.referenceC, 2) : String("null"));
     json += ",\"auto_running\":" + String(autoRunning ? "true" : "false");
     json += ",\"failsafe\":" + String(sensorFailsafe ? "true" : "false");
     json += ",\"control\":{\"auto_enabled\":" + String(control.autoEnabled ? "true" : "false");
@@ -314,6 +324,7 @@ void sendStatus() {
     json += ",\"max_percent\":" + String(control.maxPercent);
     json += ",\"manual_percent\":" + String(control.manualPercent);
     json += ",\"strategy\":\"" + String(control.curveMode ? "curve" : "threshold") + "\"";
+    json += ",\"curve_deadband_c\":" + String(control.curveDeadbandC, 2);
     json += ",\"curve_hysteresis_c\":" + String(control.curveHysteresisC, 2);
     json += ",\"curve_max_points\":" + String(MAX_CURVE_POINTS);
     json += ",\"curve_points\":[";
@@ -349,7 +360,7 @@ bool parseCurve(const String &text, ControlConfig &candidate) {
 }
 
 void handleControl() {
-    if (server.args() < 1 || server.args() > 10) {
+    if (server.args() < 1 || server.args() > 11) {
         server.send(400, "text/plain", "Supply at least one control setting.");
         return;
     }
@@ -366,6 +377,7 @@ void handleControl() {
             if (value != "threshold" && value != "curve") valid = false;
             else candidate.curveMode = value == "curve";
         } else if (name == "curve") valid = parseCurve(value, candidate) && valid;
+        else if (name == "curve_deadband_c") valid = parseNumber(value, candidate.curveDeadbandC) && valid;
         else if (name == "curve_hysteresis_c") valid = parseNumber(value, candidate.curveHysteresisC) && valid;
         else if (name == "stop_c") valid = parseNumber(value, candidate.stopC) && valid;
         else if (name == "start_c") valid = parseNumber(value, candidate.startC) && valid;
@@ -376,7 +388,7 @@ void handleControl() {
         else valid = false;
     }
     if (!valid || !validControl(candidate, FAN_MIN_PERCENT, FAN_MAX_PERCENT)) {
-        server.send(400, "text/plain", "Require -20 <= stop < start < full <= 120 C (at least 0.5 C apart), valid duty limits, and offset -20..20 C. Curve: 2..10 points, increasing temperatures at least 0.5 C apart, nondecreasing duties of 0 or 20..100%, with a nonzero final point; curve hysteresis 0..10 C. Unknown or duplicate fields are rejected.");
+        server.send(400, "text/plain", "Require -20 <= stop < start < full <= 120 C (at least 0.5 C apart), valid duty limits, and offset -20..20 C. Curve: 2..10 points, increasing temperatures at least 0.5 C apart, nondecreasing duties of 0 or 20..100%, with a nonzero final point; curve restart hysteresis and speed deadband 0..10 C. Unknown or duplicate fields are rejected.");
         return;
     }
     if (!changeControl(candidate)) {

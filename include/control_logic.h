@@ -19,9 +19,11 @@ struct ControlConfig {
     uint8_t curveMode = 0;
     uint8_t curveCount = 4;
     CurvePoint curvePoints[MAX_CURVE_POINTS] = {{35, 0}, {40, 30}, {50, 65}, {60, 100}};
+    float curveDeadbandC = 2.0f;
 };
 
 inline bool validControl(const ControlConfig &c, unsigned minimum, unsigned maximum) {
+    if (!std::isfinite(c.curveDeadbandC) || c.curveDeadbandC < 0 || c.curveDeadbandC > 10) return false;
     if (c.curveMode > 1 || c.curveCount < 2 || c.curveCount > MAX_CURVE_POINTS
         || !std::isfinite(c.curveHysteresisC) || c.curveHysteresisC < 0 || c.curveHysteresisC > 10) return false;
     for (size_t i = 0; i < c.curveCount; ++i) {
@@ -76,6 +78,31 @@ inline FanDecision decideFan(const ControlConfig &c, float temperatureC, bool va
     if (ratio > 1) ratio = 1;
     const unsigned duty = static_cast<unsigned>(std::lround(c.minPercent + ratio * (c.maxPercent - c.minPercent)));
     return {duty, true, false};
+}
+
+struct CurveState {
+    float referenceC = NAN;
+    unsigned percent = 0;
+    bool holding = false;
+};
+
+inline FanDecision stabilizeCurve(const ControlConfig &c, float temperatureC, bool wasRunning, FanDecision desired, CurveState &state) {
+    if (!c.autoEnabled || !c.curveMode || desired.failsafe || !std::isfinite(temperatureC)) {
+        state = CurveState{};
+        return desired;
+    }
+    const bool topPoint = temperatureC >= c.curvePoints[c.curveCount - 1].temperatureC;
+    const bool insideBand = std::isfinite(state.referenceC)
+        && std::fabs(temperatureC - state.referenceC) <= c.curveDeadbandC + 0.0001f;
+    if (wasRunning && desired.running && c.curveDeadbandC > 0 && insideBand && !topPoint) {
+        state.holding = desired.percent != state.percent;
+        desired.percent = state.percent;
+    } else {
+        state.referenceC = temperatureC;
+        state.percent = desired.percent;
+        state.holding = false;
+    }
+    return desired;
 }
 
 struct HistorySample { uint32_t seconds; float temperatureC; uint8_t percent; };
