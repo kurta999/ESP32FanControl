@@ -4,10 +4,14 @@
 #include <ESPmDNS.h>
 #include <Preferences.h>
 #include <driver/gpio.h>
+#include <esp_timer.h>
+#include <cstdlib>
+#include "control_logic.h"
+#include "web_page.h"
 #include "fan_config.h"
 #include "secrets.h"
 
-static_assert(FAN_MIN_PERCENT > 0 && FAN_MAX_PERCENT < 100, "Duty limits must be inside 0..100");
+static_assert(FAN_MIN_PERCENT > 0 && FAN_MAX_PERCENT <= 100, "Duty limits must be inside 1..100");
 static_assert(FAN_DEFAULT_PERCENT >= FAN_MIN_PERCENT && FAN_DEFAULT_PERCENT <= FAN_MAX_PERCENT, "Invalid default");
 static_assert(FAN_STARTUP_PERCENT >= FAN_MIN_PERCENT && FAN_STARTUP_PERCENT <= FAN_MAX_PERCENT, "Invalid startup");
 static_assert(FAN_PWM_BITS > 0 && FAN_PWM_BITS <= 16, "Invalid PWM resolution");
@@ -27,23 +31,20 @@ String stationPassword;
 bool wifiSaved = false;
 bool networkChangePending = false;
 uint32_t networkChangeAt = 0;
+ControlConfig control;
+bool controlSaved = false;
+bool autoRunning = false;
+bool temperatureValid = false;
+bool temperatureSampled = false;
+bool sensorFailsafe = false;
+float rawTemperatureC = NAN;
+float filteredTemperatureC = NAN;
+uint32_t lastTemperatureAt = 0;
+uint32_t lastHistoryAt = 0;
+TemperatureHistory<TEMPERATURE_HISTORY_CAPACITY> temperatureHistory;
+
 struct NetworkConfig { char ssid[33]; char password[65]; };
 static_assert(sizeof(WIFI_AP_PASSWORD) >= 9 && sizeof(WIFI_AP_PASSWORD) <= 64, "AP password must be 8..63 characters");
-
-const char page[] PROGMEM = R"HTML(<!doctype html>
-<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ESP32 Fan Control</title>
-<style>
-:root{color-scheme:dark;font:17px system-ui;background:#0d1522;color:#e7edf5}body{margin:0;min-height:100vh;display:grid;place-items:center}main{width:min(440px,85vw);padding:32px;background:#172336;border:1px solid #30415c;border-radius:24px}h1{font-size:27px;margin:6px 0 24px}.eyebrow{color:#60d6bd;font-size:12px;letter-spacing:.16em}output{font-size:64px;font-weight:700;display:block;margin:20px 0}input{width:100%;accent-color:#60d6bd}button{border:0;border-radius:10px;background:#60d6bd;color:#102321;padding:13px 20px;font:inherit;font-weight:600;cursor:pointer;width:100%;margin-top:20px}dl{display:grid;grid-template-columns:1fr 1fr;font-size:14px;gap:10px;margin-top:28px}dd{text-align:right;margin:0;color:#aac0dc}p{font-size:14px;color:#aac0dc}#message{min-height:3em}button:disabled{opacity:.5}
-</style><main><div class="eyebrow">LOCAL FAN CONTROLLER</div><h1>ESP32 Fan Control</h1><p><a style="color:#60d6bd" href="/wifi">Wi-Fi settings</a></p>
-<form id="fan"><label for="percent">Requested PWM duty</label><output id="value" for="percent">50%</output><input id="percent" name="percent" type="range" min="20" max="80" step="1" value="50"><button id="apply">Apply speed</button></form>
-<p id="message" role="status" aria-live="polite">Connecting to controller…</p><dl><dt>Applied duty</dt><dd id="applied">—</dd><dt>PWM output</dt><dd id="pin">—</dd><dt>Wi-Fi</dt><dd id="wifi">—</dd></dl><p>Duty is the electrical PWM setting. Fan RPM is not measured.</p></main>
-<script>
-const slider=document.getElementById('percent'), value=document.getElementById('value'), message=document.getElementById('message'), button=document.getElementById('apply');let dirty=false,busy=false,initialized=false;
-slider.oninput=()=>{dirty=true;value.textContent=slider.value+'%'};
-async function refresh(){if(busy)return;try{const r=await fetch('/api/status',{cache:'no-store'});if(!r.ok)throw Error('Status unavailable');const s=await r.json();slider.min=s.min_percent;slider.max=s.max_percent;if(!dirty){slider.value=s.target_percent;value.textContent=s.target_percent+'%'}document.getElementById('applied').textContent=s.applied_percent+'%'+(s.startup?' (starting)':'');document.getElementById('pin').textContent='GPIO '+s.pwm_pin+' · '+s.pwm_hz+' Hz';document.getElementById('wifi').textContent=s.connected?'Connected':'Reconnecting';if(!initialized){message.textContent='Controller ready.';initialized=true}}catch(e){message.textContent='Controller unreachable. Retrying…'}}
-document.getElementById('fan').onsubmit=async e=>{e.preventDefault();busy=true;button.disabled=true;try{const r=await fetch('/api/fan',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({percent:slider.value})});if(!r.ok)throw Error(await r.text());const s=await r.json();dirty=false;message.textContent='Speed set to '+s.target_percent+'%.'}catch(e){message.textContent='Could not apply speed: '+e.message}finally{busy=false;button.disabled=false;await refresh()}};refresh();setInterval(refresh,2500);
-</script></html>)HTML";
 
 const char wifiPage[] PROGMEM = R"HTML(<!doctype html>
 <html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Wi-Fi setup · ESP32 Fan</title>
@@ -101,10 +102,174 @@ void loadNetwork() {
     }
 }
 
+ControlConfig defaultControlConfig() {
+    ControlConfig c;
+    c.manualPercent = FAN_DEFAULT_PERCENT;
+    c.maxPercent = FAN_MAX_PERCENT;
+    c.minPercent = constrain(30u, FAN_MIN_PERCENT, FAN_MAX_PERCENT);
+    return c;
+}
+
+bool saveControl(const ControlConfig &candidate) {
+    Preferences preferences;
+    if (!preferences.begin("fan-control", false)) return false;
+    const bool ok = preferences.putBytes("control-v2", &candidate, sizeof(candidate)) == sizeof(candidate);
+    preferences.end();
+    return ok;
+}
+
+void loadControl() {
+    control = defaultControlConfig();
+    ControlConfig candidate;
+    struct LegacyControl {
+        float stopC, startC, fullC, offsetC;
+        uint8_t autoEnabled, minPercent, maxPercent, manualPercent;
+    } legacy;
+    Preferences preferences;
+    if (preferences.begin("fan-control", false)) {
+        bool loaded = false;
+        if (preferences.isKey("control-v2") && preferences.getBytesLength("control-v2") == sizeof(candidate))
+            loaded = preferences.getBytes("control-v2", &candidate, sizeof(candidate)) == sizeof(candidate);
+        else if (preferences.isKey("control-v1") && preferences.getBytesLength("control-v1") == sizeof(legacy)
+            && preferences.getBytes("control-v1", &legacy, sizeof(legacy)) == sizeof(legacy)) {
+            candidate.stopC = legacy.stopC; candidate.startC = legacy.startC;
+            candidate.fullC = legacy.fullC; candidate.offsetC = legacy.offsetC;
+            candidate.autoEnabled = legacy.autoEnabled; candidate.minPercent = legacy.minPercent;
+            candidate.maxPercent = legacy.maxPercent; candidate.manualPercent = legacy.manualPercent;
+            loaded = true;
+        }
+        if (loaded && validControl(candidate, FAN_MIN_PERCENT, FAN_MAX_PERCENT)) {
+            control = candidate;
+            controlSaved = true;
+        }
+        preferences.end();
+    }
+}
+
+float currentTemperature() {
+    return temperatureValid ? filteredTemperatureC + control.offsetC : NAN;
+}
+
 void applyDuty(unsigned percent) {
+    if (appliedPercent == percent) return;
     const uint32_t duty = (((1UL << FAN_PWM_BITS) - 1) * percent + 50) / 100;
     ledcWrite(pwmChannel, duty);
     appliedPercent = percent;
+}
+
+void updateControl() {
+    const bool fresh = temperatureValid && temperatureSampled && millis() - lastTemperatureAt <= TEMPERATURE_STALE_MS;
+    const auto decision = decideFan(control, currentTemperature(), fresh, autoRunning, FAN_MAX_PERCENT, FAN_MIN_PERCENT);
+    targetPercent = decision.percent;
+    autoRunning = decision.running;
+    sensorFailsafe = decision.failsafe;
+    if (targetPercent == 0) {
+        startupActive = false;
+        applyDuty(0);
+    } else if (!startupActive) {
+        if (appliedPercent == 0) {
+            startupActive = true;
+            startupAt = millis();
+            applyDuty(FAN_STARTUP_PERCENT);
+        } else applyDuty(targetPercent);
+    }
+}
+
+bool changeControl(const ControlConfig &candidate) {
+    if (!validControl(candidate, FAN_MIN_PERCENT, FAN_MAX_PERCENT) || !saveControl(candidate)) return false;
+    if (candidate.autoEnabled != control.autoEnabled || candidate.curveMode != control.curveMode) autoRunning = false;
+    control = candidate;
+    controlSaved = true;
+    updateControl();
+    return true;
+}
+
+bool setTarget(unsigned value) {
+    ControlConfig candidate = control;
+    candidate.autoEnabled = 0;
+    candidate.manualPercent = value;
+    return changeControl(candidate);
+}
+
+uint32_t uptimeSeconds() {
+    return static_cast<uint32_t>(esp_timer_get_time() / 1000000);
+}
+
+void serviceTemperature() {
+    if (temperatureSampled && millis() - lastTemperatureAt < TEMPERATURE_SAMPLE_MS) return;
+    const float reading = temperatureRead();
+    const bool valid = std::isfinite(reading) && reading >= -40 && reading <= 125;
+    if (valid) {
+        if (!temperatureValid) filteredTemperatureC = reading;
+        else filteredTemperatureC += 0.25f * (reading - filteredTemperatureC);
+        rawTemperatureC = reading;
+    } else {
+        rawTemperatureC = NAN;
+        filteredTemperatureC = NAN;
+    }
+    temperatureValid = valid;
+    temperatureSampled = true;
+    lastTemperatureAt = millis();
+    updateControl();
+    if (temperatureHistory.size() == 0 || millis() - lastHistoryAt >= TEMPERATURE_HISTORY_MS) {
+        temperatureHistory.add(uptimeSeconds(), currentTemperature(), appliedPercent);
+        lastHistoryAt = millis();
+    }
+}
+
+bool parseNumber(const String &text, float &value) {
+    if (text.isEmpty() || text.length() > 16) return false;
+    for (size_t i = 0; i < text.length(); ++i)
+        if (isspace(static_cast<unsigned char>(text[i])) || text[i] == '\0') return false;
+    char *end = nullptr;
+    value = strtof(text.c_str(), &end);
+    return end != text.c_str() && end == text.c_str() + text.length() && std::isfinite(value);
+}
+
+bool parseByte(const String &text, uint8_t &value) {
+    if (text.isEmpty() || text.length() > 3) return false;
+    unsigned number = 0;
+    for (size_t i = 0; i < text.length(); ++i) {
+        if (text[i] < '0' || text[i] > '9') return false;
+        number = number * 10 + text[i] - '0';
+    }
+    if (number > 255) return false;
+    value = number;
+    return true;
+}
+
+void sendHistory() {
+    unsigned minutes = 5;
+    if (server.args() != 0) {
+        const String text = server.arg("minutes");
+        if (server.args() != 1 || !server.hasArg("minutes") || (text != "5" && text != "10" && text != "20" && text != "30")) {
+            server.send(400, "text/plain", "Choose minutes=5, 10, 20, or 30.");
+            return;
+        }
+        minutes = text.toInt();
+    }
+    const uint32_t now = uptimeSeconds();
+    String json;
+    if (!json.reserve(160 + temperatureHistory.size() * 32)) {
+        server.send(503, "text/plain", "Not enough memory to return history.");
+        return;
+    }
+    json = "{\"uptime_s\":" + String(now) + ",\"minutes\":" + String(minutes)
+        + ",\"sample_period_s\":" + String(TEMPERATURE_HISTORY_MS / 1000) + ",\"samples\":[";
+    bool first = true;
+    for (size_t i = 0; i < temperatureHistory.size(); ++i) {
+        const auto &sample = temperatureHistory.at(i);
+        const uint32_t age = now - sample.seconds;
+        if (age > minutes * 60) continue;
+        if (!first) json += ',';
+        first = false;
+        json += '[' + String(age) + ',';
+        json += std::isfinite(sample.temperatureC) ? String(sample.temperatureC, 2) : String("null");
+        json += ',' + String(sample.percent) + ']';
+    }
+    json += "]}";
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(200, "application/json", json);
 }
 
 bool parsePercent(const String &text, unsigned &result) {
@@ -114,19 +279,14 @@ bool parsePercent(const String &text, unsigned &result) {
         if (text[i] < '0' || text[i] > '9') return false;
         value = value * 10 + (text[i] - '0');
     }
-    if (value < FAN_MIN_PERCENT || value > FAN_MAX_PERCENT) return false;
+    if ((value != 0 && value < FAN_MIN_PERCENT) || value > FAN_MAX_PERCENT) return false;
     result = value;
     return true;
 }
 
-void setTarget(unsigned value) {
-    targetPercent = value;
-    if (!startupActive) applyDuty(value);
-}
-
 void sendStatus() {
     String json;
-    json.reserve(300);
+    json.reserve(1500);
     json = "{\"target_percent\":" + String(targetPercent);
     json += ",\"applied_percent\":" + String(appliedPercent);
     json += ",\"min_percent\":" + String(FAN_MIN_PERCENT);
@@ -137,9 +297,93 @@ void sendStatus() {
     json += ",\"connected\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false");
     json += ",\"ip\":\"" + WiFi.localIP().toString() + "\"";
     json += ",\"ap_ip\":\"" + WiFi.softAPIP().toString() + "\"";
-    json += ",\"wifi_saved\":" + String(wifiSaved ? "true" : "false") + "}";
+    json += ",\"wifi_saved\":" + String(wifiSaved ? "true" : "false");
+    json += ",\"temperature_c\":" + (std::isfinite(currentTemperature()) ? String(currentTemperature(), 2) : String("null"));
+    json += ",\"raw_temperature_c\":" + (std::isfinite(rawTemperatureC) ? String(rawTemperatureC, 2) : String("null"));
+    json += ",\"temperature_valid\":" + String(temperatureValid ? "true" : "false");
+    json += ",\"temperature_age_ms\":" + (temperatureSampled ? String(millis() - lastTemperatureAt) : String("null"));
+    json += ",\"uptime_s\":" + String(uptimeSeconds());
+    json += ",\"auto_running\":" + String(autoRunning ? "true" : "false");
+    json += ",\"failsafe\":" + String(sensorFailsafe ? "true" : "false");
+    json += ",\"control\":{\"auto_enabled\":" + String(control.autoEnabled ? "true" : "false");
+    json += ",\"stop_c\":" + String(control.stopC, 2);
+    json += ",\"start_c\":" + String(control.startC, 2);
+    json += ",\"full_c\":" + String(control.fullC, 2);
+    json += ",\"offset_c\":" + String(control.offsetC, 2);
+    json += ",\"min_percent\":" + String(control.minPercent);
+    json += ",\"max_percent\":" + String(control.maxPercent);
+    json += ",\"manual_percent\":" + String(control.manualPercent);
+    json += ",\"strategy\":\"" + String(control.curveMode ? "curve" : "threshold") + "\"";
+    json += ",\"curve_hysteresis_c\":" + String(control.curveHysteresisC, 2);
+    json += ",\"curve_max_points\":" + String(MAX_CURVE_POINTS);
+    json += ",\"curve_points\":[";
+    for (size_t i = 0; i < control.curveCount; ++i) {
+        if (i) json += ',';
+        json += "{\"temperature_c\":" + String(control.curvePoints[i].temperatureC, 2)
+            + ",\"percent\":" + String(control.curvePoints[i].percent) + "}";
+    }
+    json += ']';
+    json += ",\"saved\":" + String(controlSaved ? "true" : "false") + "}}";
     server.sendHeader("Cache-Control", "no-store");
     server.send(200, "application/json", json);
+}
+
+bool parseCurve(const String &text, ControlConfig &candidate) {
+    if (text.isEmpty() || text.length() > 300) return false;
+    size_t count = 0;
+    int start = 0;
+    while (start < static_cast<int>(text.length())) {
+        if (count >= MAX_CURVE_POINTS) return false;
+        int end = text.indexOf(',', start);
+        if (end < 0) end = text.length();
+        const String point = text.substring(start, end);
+        const int colon = point.indexOf(':');
+        if (colon < 1 || !parseNumber(point.substring(0, colon), candidate.curvePoints[count].temperatureC)
+            || !parseByte(point.substring(colon + 1), candidate.curvePoints[count].percent)) return false;
+        ++count;
+        start = end + 1;
+        if (start == static_cast<int>(text.length())) return false;
+    }
+    candidate.curveCount = count;
+    return true;
+}
+
+void handleControl() {
+    if (server.args() < 1 || server.args() > 10) {
+        server.send(400, "text/plain", "Supply at least one control setting.");
+        return;
+    }
+    ControlConfig candidate = control;
+    bool valid = true;
+    for (int i = 0; i < server.args(); ++i) {
+        const String name = server.argName(i);
+        for (int j = 0; j < i; ++j) if (name == server.argName(j)) valid = false;
+        const String value = server.arg(i);
+        if (name == "auto_enabled") {
+            if (value != "0" && value != "1") valid = false;
+            else candidate.autoEnabled = value == "1";
+        } else if (name == "strategy") {
+            if (value != "threshold" && value != "curve") valid = false;
+            else candidate.curveMode = value == "curve";
+        } else if (name == "curve") valid = parseCurve(value, candidate) && valid;
+        else if (name == "curve_hysteresis_c") valid = parseNumber(value, candidate.curveHysteresisC) && valid;
+        else if (name == "stop_c") valid = parseNumber(value, candidate.stopC) && valid;
+        else if (name == "start_c") valid = parseNumber(value, candidate.startC) && valid;
+        else if (name == "full_c") valid = parseNumber(value, candidate.fullC) && valid;
+        else if (name == "offset_c") valid = parseNumber(value, candidate.offsetC) && valid;
+        else if (name == "min_percent") valid = parseByte(value, candidate.minPercent) && valid;
+        else if (name == "max_percent") valid = parseByte(value, candidate.maxPercent) && valid;
+        else valid = false;
+    }
+    if (!valid || !validControl(candidate, FAN_MIN_PERCENT, FAN_MAX_PERCENT)) {
+        server.send(400, "text/plain", "Require -20 <= stop < start < full <= 120 C (at least 0.5 C apart), valid duty limits, and offset -20..20 C. Curve: 2..10 points, increasing temperatures at least 0.5 C apart, nondecreasing duties of 0 or 20..100%, with a nonzero final point; curve hysteresis 0..10 C. Unknown or duplicate fields are rejected.");
+        return;
+    }
+    if (!changeControl(candidate)) {
+        server.send(503, "text/plain", "Could not save control settings to flash. Existing settings unchanged.");
+        return;
+    }
+    sendStatus();
 }
 
 void printStatus() {
@@ -148,6 +392,7 @@ void printStatus() {
     else Serial.printf("Wi-Fi connecting (status %d); PWM continues independently.\n", static_cast<int>(WiFi.status()));
     Serial.printf("Setup AP: %s, http://%s/wifi\n", WIFI_AP_SSID, WiFi.softAPIP().toString().c_str());
     Serial.printf("Wi-Fi settings saved: %s\n", wifiSaved ? "yes" : "no");
+    Serial.printf("Chip temperature: %.2f C, automatic mode %s%s\n", currentTemperature(), control.autoEnabled ? "ON" : "OFF", sensorFailsafe ? " (sensor failsafe)" : "");
 }
 
 void serviceSerial() {
@@ -162,8 +407,8 @@ void serviceSerial() {
                 line[length] = '\0';
                 unsigned value;
                 if (!overflow && String(line) == "?") printStatus();
-                else if (!overflow && parsePercent(String(line), value)) { setTarget(value); printStatus(); }
-                else Serial.printf("Invalid command. Enter %u..%u or ?.\n", FAN_MIN_PERCENT, FAN_MAX_PERCENT);
+                else if (!overflow && parsePercent(String(line), value)) { if (!setTarget(value)) Serial.println("Could not save manual setting."); printStatus(); }
+                else Serial.printf("Invalid command. Enter 0 (off), %u..%u, or ?.\n", FAN_MIN_PERCENT, FAN_MAX_PERCENT);
             }
             length = 0; overflow = false;
         } else if (length < sizeof(line) - 1) line[length++] = c;
@@ -204,10 +449,15 @@ void setup() {
         while (true) delay(1000);
     }
     ledcAttachPin(FAN_PWM_PIN, pwmChannel);
-    applyDuty(FAN_STARTUP_PERCENT);
-    startupAt = millis();
     Serial.println("ESP32 standalone fan controller");
-    printStatus();
+    loadControl();
+    if (!control.autoEnabled && control.manualPercent == 0) {
+        startupActive = false;
+        applyDuty(0);
+    } else {
+        applyDuty(FAN_STARTUP_PERCENT);
+        startupAt = millis();
+    }
     WiFi.persistent(false);
     WiFi.setHostname(WIFI_HOSTNAME);
     WiFi.mode(WIFI_AP_STA);
@@ -224,6 +474,8 @@ void setup() {
     lastWifiAttempt = millis();
     server.on("/", HTTP_GET, [] { server.send_P(200, "text/html", page); });
     server.on("/api/status", HTTP_GET, sendStatus);
+    server.on("/api/history", HTTP_GET, sendHistory);
+    server.on("/api/control", HTTP_POST, handleControl);
     server.on("/wifi", HTTP_GET, [] { server.send_P(200, "text/html", wifiPage); });
     server.on("/api/wifi", HTTP_POST, [] {
         if (server.args() != 2 || !server.hasArg("ssid") || !server.hasArg("password") || !validCredentials(server.arg("ssid"), server.arg("password"))) {
@@ -242,17 +494,37 @@ void setup() {
         server.sendHeader("Cache-Control", "no-store");
         server.send(200, "application/json", "{\"saved\":true,\"connecting\":true}");
     });
+    server.on("/api/fan/off", HTTP_POST, [] {
+        if (server.args() != 0) {
+            server.send(400, "text/plain", "The fan-off action takes no arguments.");
+            return;
+        }
+        if (!setTarget(0)) {
+            server.send(503, "text/plain", "Could not save fan-off state to flash.");
+            return;
+        }
+        sendStatus();
+    });
     server.on("/api/fan", HTTP_POST, [] {
         unsigned value;
         if (server.args() != 1 || !server.hasArg("percent") || !parsePercent(server.arg("percent"), value)) {
-            server.send(400, "text/plain", "Supply one integer percent within the configured duty limits.");
+            server.send(400, "text/plain", "Supply zero (off), or one integer percent within the configured running duty limits.");
             return;
         }
-        setTarget(value);
+        if (control.autoEnabled) {
+            server.send(409, "text/plain", "Switch automatic mode OFF before setting manual duty.");
+            return;
+        }
+        if (!setTarget(value)) {
+            server.send(503, "text/plain", "Could not save manual setting to flash.");
+            return;
+        }
         sendStatus();
     });
     server.onNotFound([] { server.send(404, "text/plain", "Not found"); });
     server.begin();
+    serviceTemperature();
+    printStatus();
 }
 
 void loop() {
@@ -260,6 +532,8 @@ void loop() {
         startupActive = false;
         applyDuty(targetPercent);
     }
+    serviceTemperature();
+    updateControl();
     serviceSerial();
     serviceWifi();
     server.handleClient();
